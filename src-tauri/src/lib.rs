@@ -1,4 +1,5 @@
 mod git;
+pub mod remote_backend;
 mod review_bridge;
 
 use git::AppState;

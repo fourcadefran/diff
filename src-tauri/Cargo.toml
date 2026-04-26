@@ -23,3 +23,6 @@ git2.workspace = true
 ureq = { version = "3", features = ["json"] }
 notify.workspace = true
 notify-debouncer-full.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

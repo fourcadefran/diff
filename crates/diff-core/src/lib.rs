@@ -2,6 +2,7 @@
 //! and the standalone diff-agent binary.
 
 pub mod local;
+pub mod protocol;
 pub mod types;
 pub mod watcher;
 

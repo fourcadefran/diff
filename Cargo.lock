@@ -737,7 +737,18 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tempfile",
  "ureq",
+]
+
+[[package]]
+name = "diff-agent"
+version = "0.1.0"
+dependencies = [
+ "diff-core",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
