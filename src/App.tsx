@@ -378,7 +378,7 @@ function App() {
     }
   }, [collectAllComments, markSubmitted]);
 
-  // Honor `cub [path]` first; otherwise restore the last successfully opened repo.
+  // Honor `diff [path]` first; otherwise restore the last successfully opened repo.
   const openRef = useRef(open);
   openRef.current = open;
   useEffect(() => {
@@ -398,7 +398,7 @@ function App() {
           toast.error(`Failed to open: ${e}`);
         });
       })
-      .catch((e) => console.error("[cub] getLaunchPath failed:", e));
+      .catch((e) => console.error("[diff] getLaunchPath failed:", e));
     return () => {
       cancelled = true;
     };

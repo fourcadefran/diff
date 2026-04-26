@@ -149,7 +149,7 @@ export function useDiffs(
           } else {
             errCount += 1;
             console.warn(
-              "[cub] failed to fetch diff:",
+              "[diff] failed to fetch diff:",
               result.error ?? result.path,
             );
             deleted.push(result.path);
@@ -172,7 +172,7 @@ export function useDiffs(
       .catch((err) => {
         if (cancelled) return;
         errCount = missing.length;
-        console.warn("[cub] failed to fetch diff batch:", err);
+        console.warn("[diff] failed to fetch diff batch:", err);
         for (const request of missing) currentSides.delete(request.path);
         setDiffs((prev) => {
           let changed = false;

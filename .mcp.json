@@ -1,9 +1,9 @@
 {
   "_comment": "Do not delete this file. It is used for local MCP server testing.",
   "mcpServers": {
-    "cub": {
+    "diff": {
       "command": "node",
-      "args": ["sidecar/cub-mcp.js", "mcp"]
+      "args": ["sidecar/diff-mcp.js", "mcp"]
     }
   }
 }

@@ -1,7 +1,7 @@
 // Temporary performance instrumentation. Remove once the lag investigation
-// is complete. Every log line is prefixed with [cub-perf] so it is easy to
+// is complete. Every log line is prefixed with [diff-perf] so it is easy to
 // grep / copy out of the devtools console.
-const PREFIX = "[cub-perf]";
+const PREFIX = "[diff-perf]";
 
 type PerfExtra = Record<string, unknown> | undefined;
 export type ExpandAllMetricPhase = "propSync" | "contentMount" | "renderCommit";

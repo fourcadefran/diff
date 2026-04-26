@@ -1,6 +1,5 @@
 mod git;
 mod review_bridge;
-mod watcher;
 
 use git::AppState;
 use std::collections::HashMap;
@@ -13,7 +12,7 @@ pub use review_bridge::sidecar_script_path;
 
 static LAUNCH_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Record an initial repository path supplied by `cub [path]` on the command
+/// Record an initial repository path supplied by `diff [path]` on the command
 /// line. Called before Tauri is built so the frontend can pick it up on mount.
 pub fn set_launch_path(path: PathBuf) {
     let _ = LAUNCH_PATH.set(path);
@@ -32,12 +31,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            repo: Mutex::new(None),
+            backend: Mutex::new(None),
             bridge: Mutex::new(None),
             event_listener: Mutex::new(None),
             event_listener_stop: stop_flag.clone(),
             clone_cancels: Mutex::new(HashMap::new()),
-            watcher: Mutex::new(None),
+            watcher_handle: Mutex::new(None),
             watcher_generation: AtomicU64::new(0),
         })
         .setup(|app| {
@@ -102,7 +101,7 @@ pub fn run() {
             }
 
             // Drop the file watcher so the background thread exits.
-            if let Ok(mut guard) = state.watcher.lock() {
+            if let Ok(mut guard) = state.watcher_handle.lock() {
                 *guard = None;
             }
 

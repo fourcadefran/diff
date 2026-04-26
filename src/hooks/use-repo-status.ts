@@ -21,7 +21,7 @@ interface UseRepoStatusReturn {
   close: () => void;
 }
 
-const LAST_OPENED_REPO_KEY = "cub:last-opened-repo";
+const LAST_OPENED_REPO_KEY = "diff:last-opened-repo";
 
 export function readLastOpenedRepo(): string | null {
   if (typeof window === "undefined") return null;

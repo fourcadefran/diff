@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, Debouncer, NoCache};
-use tauri::{AppHandle, Emitter};
 
 /// Debounced filesystem watcher. Dropping it stops the background thread and
 /// releases the watch on the underlying directory.
@@ -13,11 +12,12 @@ pub struct RepoWatcher {
 }
 
 /// Start a recursive watch on `workdir`. Worktree changes and status-relevant
-/// `.git` changes are coalesced with a 300 ms debounce and emit a single
-/// `repo:changed` Tauri event to the frontend.
-pub fn start(workdir: &Path, app: AppHandle) -> Result<RepoWatcher, String> {
-    // We only need a "repo changed" trigger. The default macOS/Windows cache
-    // walks the entire recursive tree to collect file IDs before watch() returns.
+/// `.git` changes are coalesced with a 300 ms debounce. The provided `on_change`
+/// callback is invoked from a notify worker thread.
+pub fn start<F>(workdir: &Path, on_change: F) -> Result<RepoWatcher, String>
+where
+    F: Fn() + Send + Sync + 'static,
+{
     let mut debouncer: Debouncer<RecommendedWatcher, NoCache> = new_debouncer_opt(
         Duration::from_millis(300),
         None,
@@ -27,12 +27,12 @@ pub fn start(workdir: &Path, app: AppHandle) -> Result<RepoWatcher, String> {
                     .iter()
                     .any(|ev| ev.event.paths.iter().any(|p| path_is_relevant(p)));
                 if relevant {
-                    let _ = app.emit("repo:changed", ());
+                    on_change();
                 }
             }
             Err(errors) => {
                 for err in errors {
-                    eprintln!("[cub-watcher] error: {err}");
+                    eprintln!("[diff-watcher] error: {err}");
                 }
             }
         },

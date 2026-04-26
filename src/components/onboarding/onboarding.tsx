@@ -70,7 +70,7 @@ export function Onboarding({ onOpened }: OnboardingProps) {
       <div className="mx-auto flex max-w-[720px] flex-col gap-6 px-6 pt-24 pb-16">
         <header className="flex flex-col gap-1">
           <h1 className="font-heading text-3xl font-semibold tracking-tight">
-            cub
+            diff
           </h1>
           <p className="text-sm text-muted-foreground">
             Open a repository to start reviewing.

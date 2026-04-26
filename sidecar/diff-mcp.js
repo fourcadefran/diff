@@ -13,7 +13,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod/v4";
 
-const STATE_DIR = path.join(os.homedir(), ".cub");
+const STATE_DIR = path.join(os.homedir(), ".diff");
 const STATE_PATH = path.join(STATE_DIR, "review-bridge.json");
 const DB_PATH = path.join(STATE_DIR, "reviews.db");
 
@@ -579,7 +579,7 @@ async function startServer() {
 
 async function httpRequest(method, path, body, options = {}) {
   const info = await readServerInfo();
-  if (!info) throw new Error("Cub review server is not running");
+  if (!info) throw new Error("diff review server is not running");
 
   const url = `http://127.0.0.1:${info.port}${path}`;
   const reqOptions = { method, headers: {} };
@@ -620,7 +620,7 @@ async function httpRequest(method, path, body, options = {}) {
 
 async function startMcpServer() {
   const server = new McpServer({
-    name: "cub",
+    name: "diff",
     version: "0.2.0",
   });
 
@@ -630,7 +630,7 @@ async function startMcpServer() {
     "get_review",
     {
       description:
-        "Fetch a code review batch from Cub and apply it. " +
+        "Fetch a code review batch from diff and apply it. " +
         "Each review targets a specific file and line range. " +
         "You MUST read each referenced file and understand the review. " +
         "Action types: change-request (must fix in code), question (answer in resolve_review.summary without changing code unless explicitly required), nit (minor improvement or dismiss with reason). " +
@@ -648,18 +648,18 @@ async function startMcpServer() {
 
         if (!result.review) {
           return {
-            content: [{ type: "text", text: "No reviews pending in Cub." }],
+            content: [{ type: "text", text: "No reviews pending in diff." }],
             structuredContent: {
-              message: "No reviews pending in Cub.",
+              message: "No reviews pending in diff.",
               review: null,
             },
           };
         }
 
-        return reviewToolResult(result.review, "Cub review batch");
+        return reviewToolResult(result.review, "diff review batch");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        return { content: [{ type: "text", text: `Failed to read Cub review: ${message}` }], isError: true };
+        return { content: [{ type: "text", text: `Failed to read diff review: ${message}` }], isError: true };
       }
     },
   );
@@ -670,7 +670,7 @@ async function startMcpServer() {
     "resolve_review",
     {
       description:
-        "Mark a single review item inside a Cub review batch as resolved. " +
+        "Mark a single review item inside a diff review batch as resolved. " +
         "Use `summary` to explain what changed, or to answer a question review without changing code.",
       inputSchema: {
         review_id: z.string().describe("The review item ID returned inside get_review or watch_reviews"),
@@ -698,7 +698,7 @@ async function startMcpServer() {
     "watch_reviews",
     {
       description:
-        "Block until a new code review batch arrives in Cub, then return it. " +
+        "Block until a new code review batch arrives in diff, then return it. " +
         "Use in a loop for hands-free review processing. " +
         "After detecting the first new review, waits for a batch window before returning.",
       inputSchema: {
@@ -734,7 +734,7 @@ async function startMcpServer() {
           };
         }
 
-        return reviewToolResult(result.review, "New Cub review batch");
+        return reviewToolResult(result.review, "New diff review batch");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return { content: [{ type: "text", text: `Watch failed: ${message}` }], isError: true };
@@ -748,7 +748,7 @@ async function startMcpServer() {
     "dismiss_review",
     {
       description:
-        "Dismiss a single review item inside a Cub review batch with an explanation. " +
+        "Dismiss a single review item inside a diff review batch with an explanation. " +
         "Use when a review should not be addressed.",
       inputSchema: {
         review_id: z.string().describe("The review item ID to dismiss"),
@@ -788,14 +788,14 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
 
-  console.error("Usage: node sidecar/cub-mcp.js <server|mcp>");
+  console.error("Usage: node sidecar/diff-mcp.js <server|mcp>");
   process.exit(1);
 }
 
 const entrypoint = process.argv[1] ? path.resolve(process.argv[1]) : null;
 if (entrypoint === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
-    console.error(`Cub MCP sidecar failed: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`diff MCP sidecar failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   });
 }
