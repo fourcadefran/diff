@@ -135,6 +135,6 @@ export function discardFile(path: string): Promise<void> {
   return invoke<void>("discard_file", { path });
 }
 
-export function getLaunchPath(): Promise<string | null> {
-  return invoke<string | null>("get_launch_path");
+export function openRemoteRepo(host: string, path: string): Promise<string> {
+  return invoke<string>("open_remote_repo", { host, path });
 }

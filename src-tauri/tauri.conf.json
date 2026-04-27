@@ -12,11 +12,15 @@
   "app": {
     "windows": [
       {
+        "label": "picker",
         "title": "diff",
-        "width": 1200,
-        "height": 800,
-        "minWidth": 1200,
-        "minHeight": 800
+        "url": "index.html?kind=picker",
+        "width": 480,
+        "height": 600,
+        "minWidth": 380,
+        "minHeight": 480,
+        "center": true,
+        "resizable": true
       }
     ],
     "security": {

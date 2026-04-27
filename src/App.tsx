@@ -8,11 +8,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { Sidebar } from "@/components/sidebar/sidebar";
 import { DiffPanel } from "@/components/diff-panel/diff-panel";
 import { Onboarding } from "@/components/onboarding/onboarding";
-import {
-  clearLastOpenedRepo,
-  readLastOpenedRepo,
-  useRepoStatus,
-} from "@/hooks/use-repo-status";
+import { useRepoStatus } from "@/hooks/use-repo-status";
 import { useDiffs } from "@/hooks/use-diffs";
 import { useComments } from "@/hooks/use-comments";
 import { ask } from "@tauri-apps/plugin-dialog";
@@ -24,7 +20,7 @@ import {
   commit,
   submitReview,
   discardFile,
-  getLaunchPath,
+  openRemoteRepo,
   type CommitOptions,
   type FileEntry,
 } from "@/lib/tauri";
@@ -32,6 +28,8 @@ import { toast } from "sonner";
 import { listen } from "@tauri-apps/api/event";
 import type { CommentStatus } from "@/types/comments";
 import { perfLog, perfLogJson, type ExpandAllSession } from "@/lib/perf";
+import { getWindowKind, getRepoParams } from "@/lib/window";
+import { Picker } from "@/components/picker/picker";
 
 interface CommentStatusPayload {
   review_id: string;
@@ -44,6 +42,14 @@ interface CommentStatusPayload {
 const AUTO_EXPAND_FILE_LIMIT = 100;
 
 function App() {
+  const kind = getWindowKind();
+  if (kind === "picker") {
+    return <Picker />;
+  }
+  return <RepoApp />;
+}
+
+function RepoApp() {
   const { workdir, status, error, refresh, open, close } = useRepoStatus();
   const { diffs, loading } = useDiffs(status?.staged, status?.unstaged);
   const comments = useComments();
@@ -378,30 +384,28 @@ function App() {
     }
   }, [collectAllComments, markSubmitted]);
 
-  // Honor `diff [path]` first; otherwise restore the last successfully opened repo.
+  // Open the repo this window was spawned for (host/path in URL query).
   const openRef = useRef(open);
   openRef.current = open;
   useEffect(() => {
-    let cancelled = false;
-    getLaunchPath()
-      .then((launchPath) => {
-        if (cancelled) return;
-        const restorePath = launchPath ?? readLastOpenedRepo();
-        if (!restorePath || restoreOpenStartedRef.current) return;
-        restoreOpenStartedRef.current = true;
-        perfLog("App", "open:restore", {
-          source: launchPath ? "launchPath" : "lastOpened",
-          path: restorePath,
-        });
-        openRef.current(restorePath).catch((e) => {
-          if (!launchPath) clearLastOpenedRepo();
-          toast.error(`Failed to open: ${e}`);
-        });
-      })
-      .catch((e) => console.error("[diff] getLaunchPath failed:", e));
-    return () => {
-      cancelled = true;
-    };
+    const params = getRepoParams();
+    if (!params || restoreOpenStartedRef.current) return;
+    restoreOpenStartedRef.current = true;
+    perfLog("App", "open:restore", { source: "url", path: params.path });
+    if (params.host === "local") {
+      openRef.current(params.path).catch((e) =>
+        toast.error(`Failed to open: ${e}`),
+      );
+    } else {
+      openRemoteRepo(params.host, params.path).catch((e) => {
+        const msg = String(e);
+        if (msg.includes("Could not connect to diff-agent")) {
+          toast.error(msg, { duration: 30000 });
+        } else {
+          toast.error(`Connect failed: ${msg}`);
+        }
+      });
+    }
   }, []);
 
   if (!workdir) {

@@ -23,6 +23,10 @@ git2.workspace = true
 ureq = { version = "3", features = ["json"] }
 notify.workspace = true
 notify-debouncer-full.workspace = true
+rusqlite = { version = "0.34", features = ["bundled"] }
+dirs = "6"
+ssh2-config = "0.7"
+urlencoding = "2"
 
 [dev-dependencies]
 tempfile = "3"
