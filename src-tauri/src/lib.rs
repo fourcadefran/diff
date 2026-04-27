@@ -163,15 +163,17 @@ pub fn run() {
 
             stop.store(true, Ordering::Relaxed);
         }
-        tauri::RunEvent::WindowEvent { label, event, .. } => {
-            if let tauri::WindowEvent::Destroyed = event {
-                let state: &AppState = app_handle.state::<AppState>().inner();
-                if let Ok(mut map) = state.backends.lock() {
-                    map.remove(&label);
-                }
-                if label == "picker" {
-                    app_handle.exit(0);
-                }
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } => {
+            let state: &AppState = app_handle.state::<AppState>().inner();
+            if let Ok(mut map) = state.backends.lock() {
+                map.remove(&label);
+            }
+            if label == "picker" {
+                app_handle.exit(0);
             }
         }
         _ => {}
