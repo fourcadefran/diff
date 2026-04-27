@@ -64,7 +64,7 @@ fn state_dir() -> Result<PathBuf, String> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .ok_or_else(|| "failed to resolve home directory".to_string())?;
-    Ok(home.join(".cub"))
+    Ok(home.join(".diff"))
 }
 
 fn server_info_path() -> Result<PathBuf, String> {
@@ -90,11 +90,11 @@ fn workspace_root() -> Result<PathBuf, String> {
 
 pub fn sidecar_script_path() -> Result<PathBuf, String> {
     let root = workspace_root()?;
-    let path = root.join("sidecar").join("cub-mcp.js");
+    let path = root.join("sidecar").join("diff-mcp.js");
     if path.exists() {
         return Ok(path);
     }
-    let flat = root.join("cub-mcp.js");
+    let flat = root.join("diff-mcp.js");
     if flat.exists() {
         return Ok(flat);
     }

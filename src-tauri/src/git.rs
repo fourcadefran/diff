@@ -1,22 +1,23 @@
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
-use std::process::Child;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::Path;
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use git2::build::{CheckoutBuilder, RepoBuilder};
-use git2::{FetchOptions, Index, Patch, RemoteCallbacks, Repository, Status, StatusOptions, Tree};
-use serde::{Deserialize, Serialize};
+use git2::{FetchOptions, RemoteCallbacks, Repository};
 use serde_json::json;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, Window};
 
-// Temporary perf instrumentation. Emits perf:log events to the frontend and
-// also prints to stderr so logs show up in the terminal that launched the
-// Tauri process. Remove once the lag investigation is done.
+use diff_core::{
+    BackendError, CloneProgress, FileContentsBatchItem, FileContentsRequest, GitBackend,
+    LocalGitBackend, RepoStatus, WatcherHandle,
+};
+
 fn perf_event(app: &AppHandle, op: &str, extra: serde_json::Value) {
-    eprintln!("[cub-perf] rust:{op} {extra}");
+    eprintln!("[diff-perf] rust:{op} {extra}");
     let mut payload = match extra {
         serde_json::Value::Object(m) => m,
         _ => serde_json::Map::new(),
@@ -30,1242 +31,159 @@ fn ms_since(start: Instant) -> f64 {
     (d.as_secs_f64() * 1000.0 * 100.0).round() / 100.0
 }
 
+/// One backend per open repo window. Keyed by Tauri window label.
+pub struct BackendSlot {
+    pub backend: Box<dyn GitBackend>,
+    pub _watcher: WatcherHandle,
+}
+
 pub struct AppState {
-    pub repo: Mutex<Option<Repository>>,
+    pub backends: Mutex<HashMap<String, BackendSlot>>,
     pub bridge: Mutex<Option<Child>>,
     pub event_listener: Mutex<Option<JoinHandle<()>>>,
     pub event_listener_stop: Arc<AtomicBool>,
     pub clone_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    pub watcher: Mutex<Option<crate::watcher::RepoWatcher>>,
-    pub watcher_generation: AtomicU64,
 }
 
-fn restart_watcher(app: &AppHandle, state: &AppState, workdir: &Path) {
-    let generation = state.watcher_generation.fetch_add(1, Ordering::SeqCst) + 1;
-    let workdir = workdir.to_path_buf();
-    let workdir_label = workdir.to_string_lossy().to_string();
+fn err_to_string(e: BackendError) -> String {
+    e.to_string()
+}
 
-    let clear_start = Instant::now();
-    let clear_error = match state.watcher.lock() {
-        Ok(mut guard) => {
-            *guard = None;
-            None
-        }
-        Err(e) => Some(e.to_string()),
-    };
-    perf_event(
-        app,
-        "watcher:spawn",
-        json!({
-            "generation": generation,
-            "workdir": &workdir_label,
-            "clearMs": ms_since(clear_start),
-            "clearError": clear_error,
-        }),
+fn with_backend<R>(
+    window: &Window,
+    state: &AppState,
+    f: impl FnOnce(&dyn GitBackend) -> Result<R, BackendError>,
+) -> Result<R, String> {
+    let label = window.label().to_string();
+    let map = state
+        .backends
+        .lock()
+        .map_err(|e| format!("lock poisoned: {e}"))?;
+    let slot = map
+        .get(&label)
+        .ok_or("no repository open in this window")?;
+    f(slot.backend.as_ref()).map_err(err_to_string)
+}
+
+fn install_backend(
+    app: &AppHandle,
+    window: &Window,
+    state: &AppState,
+    backend: Box<dyn GitBackend>,
+) -> Result<(), String> {
+    let label = window.label().to_string();
+    let app_clone = app.clone();
+    let label_for_emit = label.clone();
+    let watcher = backend
+        .subscribe_changes(Box::new(move || {
+            if let Some(w) = app_clone.get_webview_window(&label_for_emit) {
+                let _ = w.emit("repo:changed", ());
+            }
+        }))
+        .map_err(err_to_string)?;
+
+    let mut map = state
+        .backends
+        .lock()
+        .map_err(|e| format!("lock poisoned: {e}"))?;
+    map.insert(
+        label,
+        BackendSlot {
+            backend,
+            _watcher: watcher,
+        },
     );
-
-    let app = app.clone();
-    let _ = thread::spawn(move || {
-        let start = Instant::now();
-        let result = crate::watcher::start(&workdir, app.clone());
-        let start_ms = ms_since(start);
-        let state = app.state::<AppState>();
-
-        if state.watcher_generation.load(Ordering::SeqCst) != generation {
-            perf_event(
-                &app,
-                "watcher:stale",
-                json!({
-                    "generation": generation,
-                    "workdir": &workdir_label,
-                    "startMs": start_ms,
-                }),
-            );
-            return;
-        }
-
-        match result {
-            Ok(watcher) => {
-                let lock_start = Instant::now();
-                match state.watcher.lock() {
-                    Ok(mut guard) => {
-                        if state.watcher_generation.load(Ordering::SeqCst) != generation {
-                            perf_event(
-                                &app,
-                                "watcher:stale",
-                                json!({
-                                    "generation": generation,
-                                    "workdir": &workdir_label,
-                                    "phase": "store",
-                                    "startMs": start_ms,
-                                    "lockMs": ms_since(lock_start),
-                                }),
-                            );
-                            return;
-                        }
-                        *guard = Some(watcher);
-                        perf_event(
-                            &app,
-                            "watcher:ready",
-                            json!({
-                                "generation": generation,
-                                "workdir": &workdir_label,
-                                "startMs": start_ms,
-                                "lockMs": ms_since(lock_start),
-                            }),
-                        );
-                    }
-                    Err(e) => {
-                        perf_event(
-                            &app,
-                            "watcher:error",
-                            json!({
-                                "generation": generation,
-                                "workdir": &workdir_label,
-                                "phase": "store",
-                                "startMs": start_ms,
-                                "lockMs": ms_since(lock_start),
-                                "error": e.to_string(),
-                            }),
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[cub-watcher] failed to start: {e}");
-                perf_event(
-                    &app,
-                    "watcher:error",
-                    json!({
-                        "generation": generation,
-                        "workdir": &workdir_label,
-                        "phase": "start",
-                        "startMs": start_ms,
-                        "error": e,
-                    }),
-                );
-            }
-        }
-    });
+    Ok(())
 }
 
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangeKind {
-    Added,
-    Modified,
-    Deleted,
-    Renamed,
-    Typechange,
-}
-
-#[derive(Serialize, Clone)]
-pub struct FileEntry {
-    pub path: String,
-    pub kind: ChangeKind,
-    pub additions: u32,
-    pub deletions: u32,
-}
-
-#[derive(Serialize)]
-pub struct RepoStatus {
-    pub staged: Vec<FileEntry>,
-    pub unstaged: Vec<FileEntry>,
-    pub untracked: Vec<String>,
-}
-
-/// Open a git repository at `path` and store it in app state.
-/// Returns the absolute workdir path on success.
 #[tauri::command]
-pub fn open_repo(path: String, app: AppHandle, state: State<AppState>) -> Result<String, String> {
+pub fn open_repo(
+    path: String,
+    app: AppHandle,
+    window: Window,
+    state: State<AppState>,
+) -> Result<String, String> {
     let total_start = Instant::now();
     perf_event(&app, "open_repo:start", json!({ "path": &path }));
 
-    let discover_start = Instant::now();
-    let repo = match Repository::discover(&path) {
-        Ok(repo) => repo,
-        Err(e) => {
-            perf_event(
-                &app,
-                "open_repo:error",
-                json!({
-                    "path": &path,
-                    "phase": "discover",
-                    "discoverMs": ms_since(discover_start),
-                    "totalMs": ms_since(total_start),
-                    "error": e.to_string(),
-                }),
-            );
-            return Err(format!("failed to open repo: {e}"));
-        }
-    };
-    let discover_ms = ms_since(discover_start);
-
-    let workdir_start = Instant::now();
-    let workdir_path = match repo.workdir() {
-        Some(workdir) => workdir.to_path_buf(),
-        None => {
-            perf_event(
-                &app,
-                "open_repo:error",
-                json!({
-                    "path": &path,
-                    "phase": "workdir",
-                    "discoverMs": discover_ms,
-                    "workdirMs": ms_since(workdir_start),
-                    "totalMs": ms_since(total_start),
-                    "error": "bare repositories are not supported",
-                }),
-            );
-            return Err("bare repositories are not supported".to_string());
-        }
-    };
-    let workdir_ms = ms_since(workdir_start);
-    let workdir = workdir_path.to_string_lossy().to_string();
-
-    let lock_start = Instant::now();
-    let mut guard = match state.repo.lock() {
-        Ok(guard) => guard,
-        Err(e) => {
-            perf_event(
-                &app,
-                "open_repo:error",
-                json!({
-                    "path": &path,
-                    "workdir": &workdir,
-                    "phase": "lock",
-                    "discoverMs": discover_ms,
-                    "workdirMs": workdir_ms,
-                    "lockWaitMs": ms_since(lock_start),
-                    "totalMs": ms_since(total_start),
-                    "error": e.to_string(),
-                }),
-            );
-            return Err(format!("lock poisoned: {e}"));
-        }
-    };
-    let lock_wait_ms = ms_since(lock_start);
-
-    let state_set_start = Instant::now();
-    *guard = Some(repo);
-    drop(guard);
-    let state_set_ms = ms_since(state_set_start);
-
-    let watcher_start = Instant::now();
-    restart_watcher(&app, state.inner(), &workdir_path);
-    let watcher_spawn_ms = ms_since(watcher_start);
+    let backend = LocalGitBackend::open(Path::new(&path)).map_err(err_to_string)?;
+    let workdir = backend.workdir().to_string_lossy().to_string();
+    install_backend(&app, &window, &state, Box::new(backend))?;
 
     perf_event(
         &app,
         "open_repo",
-        json!({
-            "path": &path,
-            "workdir": &workdir,
-            "totalMs": ms_since(total_start),
-            "discoverMs": discover_ms,
-            "workdirMs": workdir_ms,
-            "lockWaitMs": lock_wait_ms,
-            "stateSetMs": state_set_ms,
-            "watcherSpawnMs": watcher_spawn_ms,
-        }),
+        json!({ "path": &path, "workdir": &workdir, "totalMs": ms_since(total_start) }),
     );
     Ok(workdir)
 }
 
-enum CountDiffKind {
-    /// HEAD tree → index.
-    StagedAgainstHead(Option<git2::Oid>),
-    /// index → workdir.
-    Unstaged,
-}
-
-fn build_diff_for_count<'a>(
-    repo: &'a Repository,
-    kind: &CountDiffKind,
-) -> Result<git2::Diff<'a>, git2::Error> {
-    match kind {
-        CountDiffKind::StagedAgainstHead(tree_oid) => {
-            let tree = tree_oid.and_then(|oid| repo.find_tree(oid).ok());
-            repo.diff_tree_to_index(tree.as_ref(), None, None)
-        }
-        CountDiffKind::Unstaged => repo.diff_index_to_workdir(None, None),
-    }
-}
-
-/// Compute per-file `(additions, deletions)` for a diff in parallel. Each
-/// worker opens its own `Repository` and re-creates the diff (cheap: ~ms),
-/// then computes `Patch::from_diff` on its slice of delta indexes. git2's
-/// `Diff` is `!Send`/`!Sync`, so this is the only way to split xdiff work
-/// across cores — which matters because xdiff for 600+ files is CPU-bound
-/// and was pinning a single core at ~300ms.
-fn count_diff_lines_parallel(
-    workdir: &Path,
-    kind: CountDiffKind,
-    delta_count: usize,
-) -> HashMap<String, (u32, u32)> {
-    if delta_count == 0 {
-        return HashMap::new();
-    }
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4)
-        .min(delta_count);
-    let chunk_size = delta_count.div_ceil(num_threads);
-    let kind_ref = &kind;
-
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..delta_count)
-            .step_by(chunk_size)
-            .map(|start| {
-                let end = (start + chunk_size).min(delta_count);
-                s.spawn(move || -> HashMap<String, (u32, u32)> {
-                    let Ok(repo) = Repository::open(workdir) else {
-                        return HashMap::new();
-                    };
-                    let Ok(diff) = build_diff_for_count(&repo, kind_ref) else {
-                        return HashMap::new();
-                    };
-                    let mut counts = HashMap::new();
-                    for idx in start..end {
-                        let Some(delta) = diff.get_delta(idx) else {
-                            continue;
-                        };
-                        let Some(path) = delta
-                            .new_file()
-                            .path()
-                            .or_else(|| delta.old_file().path())
-                            .and_then(|p| p.to_str())
-                            .map(str::to_owned)
-                        else {
-                            continue;
-                        };
-                        let Ok(Some(patch)) = Patch::from_diff(&diff, idx) else {
-                            continue;
-                        };
-                        let Ok((_, adds, dels)) = patch.line_stats() else {
-                            continue;
-                        };
-                        counts.insert(
-                            path,
-                            (
-                                u32::try_from(adds).unwrap_or(u32::MAX),
-                                u32::try_from(dels).unwrap_or(u32::MAX),
-                            ),
-                        );
-                    }
-                    counts
-                })
-            })
-            .collect();
-
-        let mut merged = HashMap::with_capacity(delta_count);
-        for handle in handles {
-            if let Ok(map) = handle.join() {
-                merged.extend(map);
-            }
-        }
-        merged
-    })
-}
-
 #[tauri::command]
-pub fn get_repo_status(app: AppHandle, state: State<AppState>) -> Result<RepoStatus, String> {
-    let total_start = Instant::now();
-    let (
-        status_entries,
-        statuses_count,
-        staged_counts,
-        unstaged_counts,
-        lock_ms,
-        statuses_ms,
-        staged_diff_ms,
-        unstaged_diff_ms,
-        staged_count_ms,
-        unstaged_count_ms,
-    ) = {
-        let lock_start = Instant::now();
-        let lock = state
-            .repo
-            .lock()
-            .map_err(|e| format!("lock poisoned: {e}"))?;
-        let lock_ms = ms_since(lock_start);
-        let repo = lock.as_ref().ok_or("no repository open")?;
-        let workdir_path = repo.workdir().ok_or("bare repository")?.to_path_buf();
-
-        let mut opts = StatusOptions::new();
-        opts.include_untracked(true).recurse_untracked_dirs(true);
-
-        let statuses_start = Instant::now();
-        let statuses = repo
-            .statuses(Some(&mut opts))
-            .map_err(|e| format!("failed to get status: {e}"))?;
-        let statuses_ms = ms_since(statuses_start);
-        let statuses_count = statuses.len();
-        let status_entries: Vec<(String, Status)> = statuses
-            .iter()
-            .filter_map(|entry| entry.path().map(|p| (p.to_string(), entry.status())))
-            .collect();
-
-        let head_tree = repo
-            .revparse_single("HEAD^{tree}")
-            .ok()
-            .and_then(|obj| obj.into_tree().ok());
-        let head_tree_oid = head_tree.as_ref().map(|t| t.id());
-
-        let staged_diff_start = Instant::now();
-        let staged_diff = repo
-            .diff_tree_to_index(head_tree.as_ref(), None, None)
-            .map_err(|e| format!("failed to diff staged: {e}"))?;
-        let staged_diff_ms = ms_since(staged_diff_start);
-        let staged_delta_count = staged_diff.deltas().count();
-
-        let unstaged_diff_start = Instant::now();
-        let unstaged_diff = repo
-            .diff_index_to_workdir(None, None)
-            .map_err(|e| format!("failed to diff unstaged: {e}"))?;
-        let unstaged_diff_ms = ms_since(unstaged_diff_start);
-        let unstaged_delta_count = unstaged_diff.deltas().count();
-
-        // Count line stats while holding the repo lock so a concurrent
-        // `open_repo` cannot swap `state.repo` and let a stale snapshot land
-        // on top of a freshly opened repository.
-        let staged_count_start = Instant::now();
-        let staged_counts = count_diff_lines_parallel(
-            &workdir_path,
-            CountDiffKind::StagedAgainstHead(head_tree_oid),
-            staged_delta_count,
-        );
-        let staged_count_ms = ms_since(staged_count_start);
-
-        let unstaged_count_start = Instant::now();
-        let unstaged_counts =
-            count_diff_lines_parallel(&workdir_path, CountDiffKind::Unstaged, unstaged_delta_count);
-        let unstaged_count_ms = ms_since(unstaged_count_start);
-
-        (
-            status_entries,
-            statuses_count,
-            staged_counts,
-            unstaged_counts,
-            lock_ms,
-            statuses_ms,
-            staged_diff_ms,
-            unstaged_diff_ms,
-            staged_count_ms,
-            unstaged_count_ms,
-        )
-    };
-
-    let mut staged = Vec::new();
-    let mut unstaged = Vec::new();
-    let mut untracked = Vec::new();
-
-    let classify_start = Instant::now();
-    for (path, s) in status_entries {
-        if s.intersects(
-            git2::Status::INDEX_NEW
-                | git2::Status::INDEX_MODIFIED
-                | git2::Status::INDEX_DELETED
-                | git2::Status::INDEX_RENAMED
-                | git2::Status::INDEX_TYPECHANGE,
-        ) {
-            let kind = if s.contains(git2::Status::INDEX_NEW) {
-                ChangeKind::Added
-            } else if s.contains(git2::Status::INDEX_MODIFIED) {
-                ChangeKind::Modified
-            } else if s.contains(git2::Status::INDEX_DELETED) {
-                ChangeKind::Deleted
-            } else if s.contains(git2::Status::INDEX_RENAMED) {
-                ChangeKind::Renamed
-            } else {
-                ChangeKind::Typechange
-            };
-            let (additions, deletions) = staged_counts.get(&path).copied().unwrap_or((0, 0));
-            staged.push(FileEntry {
-                path: path.clone(),
-                kind,
-                additions,
-                deletions,
-            });
-        }
-
-        if s.intersects(
-            git2::Status::WT_MODIFIED
-                | git2::Status::WT_DELETED
-                | git2::Status::WT_RENAMED
-                | git2::Status::WT_TYPECHANGE,
-        ) {
-            let kind = if s.contains(git2::Status::WT_MODIFIED) {
-                ChangeKind::Modified
-            } else if s.contains(git2::Status::WT_DELETED) {
-                ChangeKind::Deleted
-            } else if s.contains(git2::Status::WT_RENAMED) {
-                ChangeKind::Renamed
-            } else {
-                ChangeKind::Typechange
-            };
-            let (additions, deletions) = unstaged_counts.get(&path).copied().unwrap_or((0, 0));
-            unstaged.push(FileEntry {
-                path: path.clone(),
-                kind,
-                additions,
-                deletions,
-            });
-        }
-
-        if s.contains(git2::Status::WT_NEW) {
-            untracked.push(path);
-        }
-    }
-    let classify_ms = ms_since(classify_start);
-
-    perf_event(
-        &app,
-        "get_repo_status",
-        json!({
-            "totalMs": ms_since(total_start),
-            "lockWaitMs": lock_ms,
-            "statusesMs": statuses_ms,
-            "statusesCount": statuses_count,
-            "stagedDiffMs": staged_diff_ms,
-            "stagedCountLinesMs": staged_count_ms,
-            "stagedFiles": staged.len(),
-            "unstagedDiffMs": unstaged_diff_ms,
-            "unstagedCountLinesMs": unstaged_count_ms,
-            "unstagedFiles": unstaged.len(),
-            "untrackedFiles": untracked.len(),
-            "classifyMs": classify_ms,
-        }),
-    );
-
-    Ok(RepoStatus {
-        staged,
-        unstaged,
-        untracked,
-    })
-}
-
-/// Return the old (HEAD) and new (workdir) contents of a file for client-side diffing.
-/// This gives `@pierre/diffs` `parseDiffFromFile` full file contents so hunk
-/// expansion and custom hunk separators work correctly.
-#[derive(Serialize)]
-pub struct FileContentsResponse {
-    pub name: String,
-    /// None when the file is absent on the HEAD side.
-    pub old_content: Option<String>,
-    /// True when the HEAD side exists but is not valid UTF-8 text.
-    pub old_binary: bool,
-    /// None when the file is absent on the workdir side.
-    pub new_content: Option<String>,
-    /// True when the workdir side exists but is not valid UTF-8 text.
-    pub new_binary: bool,
-}
-
-#[derive(Deserialize)]
-pub struct FileContentsRequest {
-    pub path: String,
-    pub staged: bool,
-}
-
-#[derive(Serialize)]
-pub struct FileContentsBatchItem {
-    pub path: String,
-    pub response: Option<FileContentsResponse>,
-    pub error: Option<String>,
-}
-
-struct FileSideContent {
-    content: Option<String>,
-    is_binary: bool,
-}
-
-impl FileSideContent {
-    /// File is absent from this side (no tree entry, or file doesn't exist on disk).
-    fn absent() -> Self {
-        Self {
-            content: None,
-            is_binary: false,
-        }
-    }
-}
-
-fn decode_file_side(bytes: &[u8]) -> FileSideContent {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => FileSideContent {
-            content: Some(text.to_owned()),
-            is_binary: false,
-        },
-        Err(_) => FileSideContent {
-            content: None,
-            is_binary: true,
-        },
-    }
-}
-
-fn read_head_tree(repo: &Repository) -> Option<Tree<'_>> {
-    repo.revparse_single("HEAD^{tree}")
-        .ok()
-        .and_then(|obj| obj.into_tree().ok())
-}
-
-fn read_tree_file(
-    repo: &Repository,
-    tree: Option<&Tree<'_>>,
-    path: &Path,
-) -> Result<FileSideContent, String> {
-    let Some(tree) = tree else {
-        return Ok(FileSideContent::absent());
-    };
-
-    let Ok(entry) = tree.get_path(path) else {
-        return Ok(FileSideContent::absent());
-    };
-
-    let object = entry
-        .to_object(repo)
-        .map_err(|e| format!("cannot read HEAD object for {}: {e}", path.display()))?;
-    let blob = object
-        .into_blob()
-        .map_err(|_| format!("HEAD entry for {} is not a blob", path.display()))?;
-
-    Ok(decode_file_side(blob.content()))
-}
-
-fn validate_repo_relative_path(path: &Path) -> Result<(), String> {
-    for component in path.components() {
-        match component {
-            Component::Normal(_) | Component::CurDir => {}
-            _ => return Err(format!("invalid path: {}", path.display())),
-        }
-    }
-    Ok(())
-}
-
-fn read_workdir_file(workdir: &Path, path: &Path) -> Result<FileSideContent, String> {
-    // Reject anything other than normal/cur-dir components so we never escape
-    // the workdir. Avoids the per-file `canonicalize()` (5+ stat syscalls per
-    // path) that previously dominated `get_file_contents_batch:readMs`.
-    validate_repo_relative_path(path)?;
-    let abs = workdir.join(path);
-    // Component filter blocks `..` but not symlinks; a tracked file like
-    // `evil.txt -> /etc/passwd` would otherwise be followed by `fs::read`.
-    let meta = match std::fs::symlink_metadata(&abs) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(FileSideContent::absent());
-        }
-        Err(e) => return Err(format!("cannot stat {}: {e}", path.display())),
-    };
-    if meta.file_type().is_symlink() {
-        return Err(format!("symlink not permitted: {}", path.display()));
-    }
-    match std::fs::read(&abs) {
-        Ok(bytes) => Ok(decode_file_side(&bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileSideContent::absent()),
-        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
-    }
-}
-
-fn read_index_file(
-    repo: &Repository,
-    index: &Index,
-    path: &Path,
-) -> Result<FileSideContent, String> {
-    let entry = match index.get_path(path, 0) {
-        Some(e) => e,
-        None => return Ok(FileSideContent::absent()),
-    };
-    let blob = repo
-        .find_blob(entry.id)
-        .map_err(|e| format!("cannot read index blob for {}: {e}", path.display()))?;
-    Ok(decode_file_side(blob.content()))
+pub fn get_repo_status(window: Window, state: State<AppState>) -> Result<RepoStatus, String> {
+    with_backend(&window, &state, |b| b.get_status())
 }
 
 #[tauri::command]
 pub fn get_file_contents_batch(
     requests: Vec<FileContentsRequest>,
-    app: AppHandle,
+    window: Window,
     state: State<AppState>,
 ) -> Result<Vec<FileContentsBatchItem>, String> {
-    let total_start = Instant::now();
-    let requested_count = requests.len();
-    let lock_start = Instant::now();
-    let lock = state
-        .repo
-        .lock()
-        .map_err(|e| format!("lock poisoned: {e}"))?;
-    let lock_ms = ms_since(lock_start);
-    let repo = lock.as_ref().ok_or("no repository open")?;
-
-    let setup_start = Instant::now();
-    let workdir_path = repo.workdir().ok_or("bare repository")?.to_path_buf();
-    let head_tree_oid = read_head_tree(repo).map(|t| t.id());
-    let needs_index = requests.iter().any(|request| request.staged);
-    let needs_workdir = requests.iter().any(|request| !request.staged);
-    let setup_ms = ms_since(setup_start);
-
-    // Release the global repo lock before the parallel read phase. Workers
-    // open their own Repository handles; holding the lock here serializes
-    // every other git2 command (refresh, stage, watcher-triggered refresh).
-    drop(lock);
-    let workdir: &Path = &workdir_path;
-
-    let read_start = Instant::now();
-
-    // Parallelize file reads across cores. git2's Repository/Index/Tree are
-    // `!Send`, so each worker opens its own Repository (cheap: ~ms) and reads
-    // its slice of files. For 600+ requests this turns ~220ms of sequential
-    // I/O + blob lookups into ~50–80ms of parallel work on an 8-core box.
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4)
-        .min(requested_count.max(1));
-    let chunk_size = requested_count.div_ceil(num_threads.max(1));
-
-    let responses: Vec<FileContentsBatchItem> = if requested_count == 0 {
-        Vec::new()
-    } else {
-        std::thread::scope(|s| {
-            let handles: Vec<_> = requests
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    s.spawn(move || -> Vec<FileContentsBatchItem> {
-                        let repo = match Repository::open(workdir) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                return chunk
-                                    .iter()
-                                    .map(|r| FileContentsBatchItem {
-                                        path: r.path.clone(),
-                                        response: None,
-                                        error: Some(format!("worker repo open failed: {e}")),
-                                    })
-                                    .collect();
-                            }
-                        };
-                        let head_tree = head_tree_oid.and_then(|oid| repo.find_tree(oid).ok());
-                        let chunk_needs_index = chunk.iter().any(|r| r.staged);
-                        let index = if chunk_needs_index {
-                            repo.index().ok()
-                        } else {
-                            None
-                        };
-
-                        let mut out = Vec::with_capacity(chunk.len());
-                        for request in chunk {
-                            let path = request.path.clone();
-                            let staged = request.staged;
-                            let relative_path = Path::new(&path);
-                            let result = (|| -> Result<FileContentsResponse, String> {
-                                let old_side =
-                                    read_tree_file(&repo, head_tree.as_ref(), relative_path)?;
-                                let new_side = if staged {
-                                    read_index_file(
-                                        &repo,
-                                        index.as_ref().ok_or("index unavailable")?,
-                                        relative_path,
-                                    )?
-                                } else {
-                                    read_workdir_file(workdir, relative_path)?
-                                };
-                                Ok(FileContentsResponse {
-                                    name: path.clone(),
-                                    old_content: old_side.content,
-                                    old_binary: old_side.is_binary,
-                                    new_content: new_side.content,
-                                    new_binary: new_side.is_binary,
-                                })
-                            })();
-                            out.push(match result {
-                                Ok(response) => FileContentsBatchItem {
-                                    path,
-                                    response: Some(response),
-                                    error: None,
-                                },
-                                Err(error) => FileContentsBatchItem {
-                                    path,
-                                    response: None,
-                                    error: Some(error),
-                                },
-                            });
-                        }
-                        out
-                    })
-                })
-                .collect();
-
-            let mut all = Vec::with_capacity(requested_count);
-            for handle in handles {
-                if let Ok(chunk) = handle.join() {
-                    all.extend(chunk);
-                }
-            }
-            all
-        })
-    };
-
-    let read_ms = ms_since(read_start);
-    let ok_count = responses.iter().filter(|r| r.response.is_some()).count();
-    let err_count = responses.len().saturating_sub(ok_count);
-
-    perf_event(
-        &app,
-        "get_file_contents_batch",
-        json!({
-            "requested": requested_count,
-            "ok": ok_count,
-            "errors": err_count,
-            "stagedRequests": needs_index,
-            "workdirRequests": needs_workdir,
-            "lockWaitMs": lock_ms,
-            "setupMs": setup_ms,
-            "readMs": read_ms,
-            "totalMs": ms_since(total_start),
-        }),
-    );
-
-    Ok(responses)
-}
-
-fn stage_path(repo: &Repository, path: &str) -> Result<(), String> {
-    let input_path = Path::new(path);
-    validate_repo_relative_path(input_path)?;
-    let mut repo_path = PathBuf::new();
-    for component in input_path.components() {
-        if let Component::Normal(part) = component {
-            repo_path.push(part);
-        }
-    }
-
-    let is_directory_path = path.ends_with('/');
-    let workdir = repo.workdir().ok_or("bare repository")?;
-    let target = workdir.join(&repo_path);
-
-    let mut index = repo
-        .index()
-        .map_err(|e| format!("failed to get index: {e}"))?;
-
-    if is_directory_path || target.is_dir() {
-        let paths = collect_status_paths(
-            repo,
-            Status::WT_NEW
-                | Status::WT_MODIFIED
-                | Status::WT_DELETED
-                | Status::WT_RENAMED
-                | Status::WT_TYPECHANGE,
-            (!repo_path.as_os_str().is_empty()).then_some(repo_path.as_path()),
-        )?;
-
-        for (path, status) in paths {
-            let child_path = Path::new(&path);
-            if child_path == repo_path || !child_path.starts_with(&repo_path) {
-                continue;
-            }
-
-            stage_index_path(&mut index, workdir, child_path, Some(status))?;
-        }
-
-        index
-            .write()
-            .map_err(|e| format!("failed to write index: {e}"))?;
-
-        return Ok(());
-    }
-
-    stage_index_path(
-        &mut index,
-        workdir,
-        &repo_path,
-        repo.status_file(&repo_path).ok(),
-    )?;
-
-    index
-        .write()
-        .map_err(|e| format!("failed to write index: {e}"))?;
-
-    Ok(())
-}
-
-fn stage_index_path(
-    index: &mut Index,
-    workdir: &Path,
-    repo_path: &Path,
-    status: Option<Status>,
-) -> Result<(), String> {
-    if workdir.join(repo_path).exists() {
-        index
-            .add_path(repo_path)
-            .map_err(|e| format!("failed to stage file: {e}"))?;
-        return Ok(());
-    }
-
-    let Some(status) = status else {
-        return Ok(());
-    };
-
-    if !status.intersects(
-        Status::WT_DELETED
-            | Status::WT_RENAMED
-            | Status::WT_TYPECHANGE
-            | Status::INDEX_DELETED
-            | Status::INDEX_RENAMED
-            | Status::INDEX_TYPECHANGE,
-    ) {
-        return Ok(());
-    }
-
-    index
-        .remove_path(repo_path)
-        .map_err(|e| format!("failed to stage file: {e}"))?;
-    Ok(())
-}
-
-fn unstage_path(repo: &Repository, path: &str) -> Result<(), String> {
-    let head_result = repo.revparse_single("HEAD");
-
-    match head_result {
-        Ok(head_obj) => {
-            repo.reset_default(Some(&head_obj), [path])
-                .map_err(|e| format!("failed to unstage file: {e}"))?;
-        }
-        Err(_) => {
-            // No HEAD yet (initial commit) — remove from index directly
-            let mut index = repo
-                .index()
-                .map_err(|e| format!("failed to get index: {e}"))?;
-            index
-                .remove_path(Path::new(path))
-                .map_err(|e| format!("failed to unstage file: {e}"))?;
-            index
-                .write()
-                .map_err(|e| format!("failed to write index: {e}"))?;
-        }
-    }
-
-    Ok(())
-}
-
-fn collect_status_paths(
-    repo: &Repository,
-    flags: Status,
-    pathspec: Option<&Path>,
-) -> Result<Vec<(String, Status)>, String> {
-    let mut opts = StatusOptions::new();
-    opts.include_untracked(true).recurse_untracked_dirs(true);
-    if let Some(pathspec) = pathspec {
-        opts.pathspec(pathspec).disable_pathspec_match(true);
-    }
-
-    let statuses = repo
-        .statuses(Some(&mut opts))
-        .map_err(|e| format!("failed to get status: {e}"))?;
-
-    let mut paths = Vec::new();
-    for entry in statuses.iter() {
-        if entry.status().intersects(flags) {
-            if let Some(path) = entry.path() {
-                paths.push((path.to_string(), entry.status()));
-            }
-        }
-    }
-
-    paths.sort_by(|a, b| a.0.cmp(&b.0));
-    paths.dedup_by(|a, b| a.0 == b.0);
-    Ok(paths)
-}
-
-fn collect_paths(repo: &Repository, flags: Status) -> Result<Vec<String>, String> {
-    collect_status_paths(repo, flags, None)
-        .map(|paths| paths.into_iter().map(|(path, _)| path).collect::<Vec<_>>())
+    with_backend(&window, &state, |b| b.get_file_contents_batch(requests))
 }
 
 #[tauri::command]
-pub fn stage_file(path: String, state: State<AppState>) -> Result<(), String> {
-    let lock = state
-        .repo
-        .lock()
-        .map_err(|e| format!("lock poisoned: {e}"))?;
-    let repo = lock.as_ref().ok_or("no repository open")?;
-
-    stage_path(repo, &path)
+pub fn stage_file(path: String, window: Window, state: State<AppState>) -> Result<(), String> {
+    with_backend(&window, &state, |b| b.stage_file(&path))
 }
 
 #[tauri::command]
-pub fn stage_all(state: State<AppState>) -> Result<(), String> {
-    let lock = state
-        .repo
-        .lock()
-        .map_err(|e| format!("lock poisoned: {e}"))?;
-    let repo = lock.as_ref().ok_or("no repository open")?;
-
-    let paths = collect_status_paths(
-        repo,
-        Status::WT_NEW
-            | Status::WT_MODIFIED
-            | Status::WT_DELETED
-            | Status::WT_RENAMED
-            | Status::WT_TYPECHANGE,
-        None,
-    )?;
-
-    let workdir = repo.workdir().ok_or("bare repository")?;
-
-    let mut index = repo
-        .index()
-        .map_err(|e| format!("failed to get index: {e}"))?;
-
-    for (path, status) in paths {
-        let repo_path = Path::new(&path);
-        stage_index_path(&mut index, workdir, repo_path, Some(status))?;
-    }
-
-    index
-        .write()
-        .map_err(|e| format!("failed to write index: {e}"))?;
-
-    Ok(())
+pub fn stage_all(window: Window, state: State<AppState>) -> Result<(), String> {
+    with_backend(&window, &state, |b| b.stage_all())
 }
 
 #[tauri::command]
-pub fn unstage_file(path: String, state: State<AppState>) -> Result<(), String> {
-    let lock = state
-        .repo
-        .lock()
-        .map_err(|e| format!("lock poisoned: {e}"))?;
-    let repo = lock.as_ref().ok_or("no repository open")?;
-
-    unstage_path(repo, &path)
+pub fn unstage_file(path: String, window: Window, state: State<AppState>) -> Result<(), String> {
+    with_backend(&window, &state, |b| b.unstage_file(&path))
 }
 
 #[tauri::command]
-pub fn unstage_all(state: State<AppState>) -> Result<(), String> {
-    let lock = state
-        .repo
-        .lock()
-        .map_err(|e| format!("lock poisoned: {e}"))?;
-    let repo = lock.as_ref().ok_or("no repository open")?;
-
-    for path in collect_paths(
-        repo,
-        Status::INDEX_NEW
-            | Status::INDEX_MODIFIED
-            | Status::INDEX_DELETED
-            | Status::INDEX_RENAMED
-            | Status::INDEX_TYPECHANGE,
-    )? {
-        unstage_path(repo, &path)?;
-    }
-
-    Ok(())
+pub fn unstage_all(window: Window, state: State<AppState>) -> Result<(), String> {
+    with_backend(&window, &state, |b| b.unstage_all())
 }
 
 #[tauri::command]
-pub fn discard_file(path: String, state: State<AppState>) -> Result<(), String> {
-    let lock = state
-        .repo
-        .lock()
-        .map_err(|e| format!("lock poisoned: {e}"))?;
-    let repo = lock.as_ref().ok_or("no repository open")?;
-    let workdir = repo.workdir().ok_or("bare repository")?;
-
-    let relative_path = Path::new(&path);
-    validate_repo_relative_path(relative_path)?;
-    // Containment check: `validate_repo_relative_path` only rejects syntactic
-    // `..`/absolute components; a symlinked parent inside the workdir would
-    // otherwise let `checkout_head` or removal escape the repo. Canonicalize
-    // workdir + (target or parent) and require `starts_with(canonical_workdir)`.
-    let target = canonical_contained_target(workdir, relative_path)?;
-
-    let status = repo
-        .status_file(relative_path)
-        .map_err(|e| format!("failed to status file: {e}"))?;
-    let index_dirty = status.intersects(
-        Status::INDEX_NEW
-            | Status::INDEX_MODIFIED
-            | Status::INDEX_DELETED
-            | Status::INDEX_RENAMED
-            | Status::INDEX_TYPECHANGE,
-    );
-
-    // Pure untracked file or directory: remove from disk, no git state to touch.
-    if status.contains(Status::WT_NEW) && !index_dirty {
-        remove_workdir_entry(&target)?;
-        return Ok(());
-    }
-
-    // If index has uncommitted changes for this path, reset to HEAD first.
-    if index_dirty {
-        match repo.revparse_single("HEAD") {
-            Ok(head_obj) => {
-                repo.reset_default(Some(&head_obj), [&path])
-                    .map_err(|e| format!("reset_default failed: {e}"))?;
-            }
-            Err(_) => {
-                // No HEAD yet (initial commit): drop from index directly.
-                let mut index = repo
-                    .index()
-                    .map_err(|e| format!("failed to get index: {e}"))?;
-                let _ = index.remove_path(relative_path);
-                index
-                    .write()
-                    .map_err(|e| format!("failed to write index: {e}"))?;
-            }
-        }
-    }
-
-    // Restore workdir from HEAD for that path, if HEAD exists.
-    if repo.revparse_single("HEAD").is_ok() {
-        let mut cb = CheckoutBuilder::new();
-        cb.force();
-        cb.path(&path);
-        repo.checkout_head(Some(&mut cb))
-            .map_err(|e| format!("checkout_head failed: {e}"))?;
-    }
-
-    // Staged-new with no HEAD counterpart: after reset the file is untracked. Remove it.
-    if let Ok(post) = repo.status_file(relative_path) {
-        let post_index_dirty = post.intersects(
-            Status::INDEX_NEW
-                | Status::INDEX_MODIFIED
-                | Status::INDEX_DELETED
-                | Status::INDEX_RENAMED
-                | Status::INDEX_TYPECHANGE,
-        );
-        if post.contains(Status::WT_NEW) && !post_index_dirty {
-            let _ = remove_workdir_entry(&target);
-        }
-    }
-
-    Ok(())
-}
-
-// Single-stat removal: classify file-vs-dir-vs-missing atomically, then act.
-// Avoids the TOCTOU `exists()` → `is_dir()` → `exists()` chain.
-fn remove_workdir_entry(target: &Path) -> Result<(), String> {
-    let meta = match std::fs::symlink_metadata(target) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("cannot stat {}: {e}", target.display())),
-    };
-    let ft = meta.file_type();
-    if ft.is_dir() {
-        std::fs::remove_dir_all(target).map_err(|e| format!("remove failed: {e}"))
-    } else {
-        std::fs::remove_file(target).map_err(|e| format!("remove failed: {e}"))
-    }
-}
-
-fn canonical_contained_target(workdir: &Path, relative_path: &Path) -> Result<PathBuf, String> {
-    let canonical_workdir = workdir
-        .canonicalize()
-        .map_err(|e| format!("cannot canonicalize workdir: {e}"))?;
-    let target = canonical_workdir.join(relative_path);
-    let safe_target = if target.exists() {
-        target
-            .canonicalize()
-            .map_err(|e| format!("cannot canonicalize target: {e}"))?
-    } else {
-        let parent = target.parent().ok_or("invalid path")?;
-        let parent_canonical = parent
-            .canonicalize()
-            .map_err(|e| format!("cannot canonicalize parent: {e}"))?;
-        parent_canonical.join(target.file_name().unwrap_or_default())
-    };
-    if !safe_target.starts_with(&canonical_workdir) {
-        return Err("path traversal detected".to_string());
-    }
-    Ok(safe_target)
+pub fn discard_file(path: String, window: Window, state: State<AppState>) -> Result<(), String> {
+    with_backend(&window, &state, |b| b.discard_file(&path))
 }
 
 #[tauri::command]
 pub fn commit(
     message: String,
     amend: Option<bool>,
+    window: Window,
     state: State<AppState>,
 ) -> Result<String, String> {
-    let lock = state
-        .repo
-        .lock()
-        .map_err(|e| format!("lock poisoned: {e}"))?;
-    let repo = lock.as_ref().ok_or("no repository open")?;
-    let amend = amend.unwrap_or(false);
-
-    if message.trim().is_empty() {
-        return Err("commit message cannot be empty".to_string());
-    }
-
-    let mut index = repo
-        .index()
-        .map_err(|e| format!("failed to get index: {e}"))?;
-
-    let tree_oid = index
-        .write_tree()
-        .map_err(|e| format!("failed to write tree: {e}"))?;
-
-    if !amend {
-        // Reject empty commits (no changes staged)
-        if let Ok(head_ref) = repo.head() {
-            if let Ok(head_commit) = head_ref.peel_to_commit() {
-                if head_commit.tree_id() == tree_oid {
-                    return Err("nothing to commit: index matches HEAD".to_string());
-                }
-            }
-        }
-    }
-
-    let tree = repo
-        .find_tree(tree_oid)
-        .map_err(|e| format!("failed to find tree: {e}"))?;
-
-    let sig = repo
-        .signature()
-        .map_err(|e| format!("failed to get signature: {e}"))?;
-
-    let oid = if amend {
-        let head_ref = repo
-            .head()
-            .map_err(|_| "cannot amend: no commit to amend".to_string())?;
-        let head_commit = head_ref
-            .peel_to_commit()
-            .map_err(|e| format!("failed to peel HEAD to commit: {e}"))?;
-        head_commit
-            .amend(
-                Some("HEAD"),
-                Some(&sig),
-                Some(&sig),
-                None,
-                Some(&message),
-                Some(&tree),
-            )
-            .map_err(|e| format!("failed to amend commit: {e}"))?
-    } else {
-        match repo.head() {
-            Ok(head_ref) => {
-                let parent = head_ref
-                    .peel_to_commit()
-                    .map_err(|e| format!("failed to peel HEAD to commit: {e}"))?;
-                repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent])
-                    .map_err(|e| format!("failed to create commit: {e}"))?
-            }
-            Err(_) => repo
-                .commit(Some("HEAD"), &sig, &sig, &message, &tree, &[])
-                .map_err(|e| format!("failed to create initial commit: {e}"))?,
-        }
-    };
-
-    Ok(oid.to_string())
+    with_backend(&window, &state, |b| b.commit(&message, amend.unwrap_or(false)))
 }
 
-#[derive(Serialize, Clone)]
-pub struct CloneProgress {
-    pub id: String,
-    pub phase: &'static str,
-    pub received_objects: usize,
-    pub total_objects: usize,
-    pub indexed_objects: usize,
-    pub received_bytes: usize,
-    pub checkout_current: usize,
-    pub checkout_total: usize,
+#[tauri::command]
+pub fn init_repo(
+    path: String,
+    app: AppHandle,
+    window: Window,
+    state: State<AppState>,
+) -> Result<String, String> {
+    let backend = LocalGitBackend::init(Path::new(&path)).map_err(err_to_string)?;
+    let workdir = backend.workdir().to_string_lossy().to_string();
+    install_backend(&app, &window, &state, Box::new(backend))?;
+    Ok(workdir)
+}
+
+#[tauri::command]
+pub fn get_repo_branch(path: String) -> Result<Option<String>, String> {
+    let backend = LocalGitBackend::open(Path::new(&path)).map_err(err_to_string)?;
+    backend.get_branch().map_err(err_to_string)
 }
 
 #[tauri::command]
@@ -1274,6 +192,7 @@ pub fn clone_repo(
     dest: String,
     id: String,
     app: AppHandle,
+    window: Window,
     state: State<AppState>,
 ) -> Result<String, String> {
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1296,7 +215,7 @@ pub fn clone_repo(
                 "clone:progress",
                 CloneProgress {
                     id: i1.clone(),
-                    phase: "fetch",
+                    phase: "fetch".to_string(),
                     received_objects: p.received_objects(),
                     total_objects: p.total_objects(),
                     indexed_objects: p.indexed_objects(),
@@ -1322,7 +241,7 @@ pub fn clone_repo(
                 "clone:progress",
                 CloneProgress {
                     id: i2.clone(),
-                    phase: "checkout",
+                    phase: "checkout".to_string(),
                     received_objects: 0,
                     total_objects: 0,
                     indexed_objects: 0,
@@ -1350,17 +269,10 @@ pub fn clone_repo(
         guard.remove(&id);
     }
 
-    let repo = result?;
-    let workdir_path = repo
-        .workdir()
-        .ok_or_else(|| "bare repositories are not supported".to_string())?
-        .to_path_buf();
-    let workdir = workdir_path.to_string_lossy().to_string();
-    *state
-        .repo
-        .lock()
-        .map_err(|e| format!("lock poisoned: {e}"))? = Some(repo);
-    restart_watcher(&app, state.inner(), &workdir_path);
+    let _repo = result?;
+    let backend = LocalGitBackend::open(Path::new(&dest)).map_err(err_to_string)?;
+    let workdir = backend.workdir().to_string_lossy().to_string();
+    install_backend(&app, &window, &state, Box::new(backend))?;
     Ok(workdir)
 }
 
@@ -1387,28 +299,42 @@ pub fn cleanup_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn init_repo(path: String, app: AppHandle, state: State<AppState>) -> Result<String, String> {
-    std::fs::create_dir_all(&path).map_err(|e| format!("mkdir failed: {e}"))?;
-    let repo = Repository::init(&path).map_err(|e| format!("init failed: {e}"))?;
-    let workdir_path = repo
-        .workdir()
-        .ok_or_else(|| "bare repositories are not supported".to_string())?
-        .to_path_buf();
-    let workdir = workdir_path.to_string_lossy().to_string();
-    *state
-        .repo
-        .lock()
-        .map_err(|e| format!("lock poisoned: {e}"))? = Some(repo);
-    restart_watcher(&app, state.inner(), &workdir_path);
-    Ok(workdir)
-}
+pub fn open_remote_repo(
+    host: String,
+    path: String,
+    app: AppHandle,
+    window: Window,
+    state: State<AppState>,
+) -> Result<String, String> {
+    let mut cmd = Command::new("ssh");
+    // ClearAllForwardings prevents inheriting LocalForward/RemoteForward from
+    // ~/.ssh/config — the agent uses stdio only and binding to those ports
+    // would just print noise (or fail if the ports are in use).
+    cmd.args([
+        "-o",
+        "ClearAllForwardings=yes",
+        &host,
+        "diff-agent",
+        "--stdio",
+        "--repo",
+        &path,
+    ]);
 
-#[tauri::command]
-pub fn get_repo_branch(path: String) -> Result<Option<String>, String> {
-    let repo = Repository::discover(&path).map_err(|e| format!("open: {e}"))?;
-    let head = match repo.head() {
-        Ok(h) => h,
-        Err(_) => return Ok(None),
-    };
-    Ok(head.shorthand().map(|s| s.to_string()))
+    let backend = crate::remote_backend::RemoteGitBackend::spawn(cmd)
+        .map_err(|e| format!("ssh spawn failed: {e}"))?;
+
+    // Surface "diff-agent not installed" early via a cheap call.
+    if let Err(e) = backend.get_branch() {
+        return Err(match e {
+            BackendError::Transport(msg) | BackendError::Protocol { message: msg, .. } => format!(
+                "Could not connect to diff-agent on {host}. \
+Install it on the host: \
+git clone https://github.com/fourcadefran/diff && cd diff && cargo build --release --bin diff-agent\n\nDetails: {msg}"
+            ),
+            other => other.to_string(),
+        });
+    }
+
+    install_backend(&app, &window, &state, Box::new(backend))?;
+    Ok(format!("{host}:{path}"))
 }

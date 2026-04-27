@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import {
   openRepo,
+  openRemoteRepo,
   getRepoStatus,
   type FileEntry,
   type RepoStatus,
@@ -18,10 +19,11 @@ interface UseRepoStatusReturn {
   error: string | null;
   refresh: () => Promise<void>;
   open: (path: string) => Promise<void>;
+  openRemote: (host: string, path: string) => Promise<void>;
   close: () => void;
 }
 
-const LAST_OPENED_REPO_KEY = "cub:last-opened-repo";
+const LAST_OPENED_REPO_KEY = "diff:last-opened-repo";
 
 export function readLastOpenedRepo(): string | null {
   if (typeof window === "undefined") return null;
@@ -184,6 +186,45 @@ export function useRepoStatus(): UseRepoStatusReturn {
     [applyStatus],
   );
 
+  const openRemote = useCallback(
+    async (host: string, path: string) => {
+      const markOpen = perfMark();
+      perfLog("useRepoStatus", "openRemote:start", { host, path });
+      setError(null);
+      try {
+        const dir = await perfTimedAsync(
+          "useRepoStatus",
+          "openRemote:openRemoteRepo",
+          () => openRemoteRepo(host, path),
+          { host, path },
+        );
+        const raw = await perfTimedAsync(
+          "useRepoStatus",
+          "openRemote:getRepoStatus",
+          () => getRepoStatus(),
+        );
+        fingerprintRef.current = "";
+        applyStatus(mergeStatus(raw));
+        setWorkdir(dir);
+        perfLog("useRepoStatus", "openRemote:done", {
+          host,
+          path,
+          workdir: dir,
+          ms: markOpen(),
+        });
+      } catch (e) {
+        perfLog("useRepoStatus", "openRemote:error", {
+          host,
+          path,
+          ms: markOpen(),
+          error: String(e),
+        });
+        throw e;
+      }
+    },
+    [applyStatus],
+  );
+
   const close = useCallback(() => {
     setWorkdir(null);
     setStatus(null);
@@ -192,5 +233,5 @@ export function useRepoStatus(): UseRepoStatusReturn {
     fingerprintRef.current = "";
   }, []);
 
-  return { workdir, status, error, refresh, open, close };
+  return { workdir, status, error, refresh, open, openRemote, close };
 }

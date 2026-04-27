@@ -111,7 +111,7 @@ export function Sidebar({
           <Section
             label="Staged"
             files={staged}
-            treeId="cub-staged-tree"
+            treeId="diff-staged-tree"
             stagedPaths={stagedPaths}
             actionLabel="Unstage All"
             onAction={onUnstageAll}
@@ -125,7 +125,7 @@ export function Sidebar({
           <Section
             label="Unstaged"
             files={unstaged}
-            treeId="cub-unstaged-tree"
+            treeId="diff-unstaged-tree"
             stagedPaths={stagedPaths}
             actionLabel="Stage All"
             onAction={onStageAll}

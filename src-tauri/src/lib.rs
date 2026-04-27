@@ -1,44 +1,80 @@
 mod git;
+pub mod remote_backend;
 mod review_bridge;
-mod watcher;
+pub mod ssh_config;
+pub mod storage;
+pub mod window;
 
 use git::AppState;
+use storage::{RecentRepo, Storage};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Manager;
 
 pub use review_bridge::sidecar_script_path;
 
-static LAUNCH_PATH: OnceLock<PathBuf> = OnceLock::new();
+#[derive(Clone)]
+pub enum LaunchSpec {
+    Local(PathBuf),
+    Remote { host: String, path: String },
+}
 
-/// Record an initial repository path supplied by `cub [path]` on the command
-/// line. Called before Tauri is built so the frontend can pick it up on mount.
-pub fn set_launch_path(path: PathBuf) {
-    let _ = LAUNCH_PATH.set(path);
+static LAUNCH_SPEC: OnceLock<LaunchSpec> = OnceLock::new();
+
+/// Record the initial repo to open, supplied by `diff [path]` or
+/// `diff [host:path]` on the command line. Called before Tauri is built.
+pub fn set_launch_spec(spec: LaunchSpec) {
+    let _ = LAUNCH_SPEC.set(spec);
+}
+
+
+#[tauri::command]
+fn list_recent_repos(host: Option<String>, storage: tauri::State<Storage>) -> Result<Vec<RecentRepo>, String> {
+    match host {
+        Some(h) => storage.list_for_host(&h),
+        None => storage.list_all_recent(50),
+    }
 }
 
 #[tauri::command]
-fn get_launch_path() -> Option<String> {
-    LAUNCH_PATH.get().map(|p| p.to_string_lossy().to_string())
+fn record_recent_repo(host: String, path: String, storage: tauri::State<Storage>) -> Result<(), String> {
+    storage.record_open(&host, &path)
+}
+
+#[tauri::command]
+fn list_ssh_hosts() -> Result<Vec<ssh_config::SshHost>, String> {
+    ssh_config::list_hosts()
+}
+
+#[tauri::command]
+fn open_picker_repo(
+    host: String,
+    path: String,
+    app: tauri::AppHandle,
+    storage: tauri::State<Storage>,
+) -> Result<(), String> {
+    storage.record_open(&host, &path)?;
+    window::open_repo_window(&app, &host, &path)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let stop_flag = Arc::new(AtomicBool::new(false));
 
+    let storage = Storage::open_default().expect("failed to open state.db");
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(storage)
         .manage(AppState {
-            repo: Mutex::new(None),
+            backends: Mutex::new(HashMap::new()),
             bridge: Mutex::new(None),
             event_listener: Mutex::new(None),
             event_listener_stop: stop_flag.clone(),
             clone_cancels: Mutex::new(HashMap::new()),
-            watcher: Mutex::new(None),
-            watcher_generation: AtomicU64::new(0),
         })
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -57,6 +93,25 @@ pub fn run() {
                     eprintln!("failed to start review server on launch: {e}");
                 }
             }
+
+            // If invoked with a path/host:path arg, open that repo window
+            // alongside the picker.
+            if let Some(spec) = LAUNCH_SPEC.get() {
+                let handle = app.handle().clone();
+                match spec {
+                    LaunchSpec::Local(path) => {
+                        let _ = window::open_repo_window(
+                            &handle,
+                            "local",
+                            &path.to_string_lossy(),
+                        );
+                    }
+                    LaunchSpec::Remote { host, path } => {
+                        let _ = window::open_repo_window(&handle, host, path);
+                    }
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -74,40 +129,51 @@ pub fn run() {
             git::init_repo,
             git::get_repo_branch,
             git::discard_file,
+            git::open_remote_repo,
             review_bridge::submit_review,
-            get_launch_path,
+            list_recent_repos,
+            record_recent_repo,
+            list_ssh_hosts,
+            open_picker_repo,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
     let stop = stop_flag;
-    app.run(move |app_handle, event| {
-        if let tauri::RunEvent::Exit = event {
+    app.run(move |app_handle, event| match event {
+        tauri::RunEvent::Exit => {
             let state: &AppState = app_handle.state::<AppState>().inner();
 
-            // Signal the SSE listener thread to stop
             state.event_listener_stop.store(true, Ordering::Relaxed);
             if let Ok(mut guard) = state.event_listener.lock() {
                 if let Some(handle) = guard.take() {
-                    // Give the thread a moment to notice the stop flag
                     let _ = handle.join();
                 }
             }
 
-            // Kill the bridge server process
             if let Ok(mut guard) = state.bridge.lock() {
                 if let Some(ref mut child) = *guard {
                     let _ = child.kill();
                 }
             }
 
-            // Drop the file watcher so the background thread exits.
-            if let Ok(mut guard) = state.watcher.lock() {
-                *guard = None;
+            if let Ok(mut map) = state.backends.lock() {
+                map.clear();
             }
 
-            // Ensure the stop flag is set (redundant but defensive)
             stop.store(true, Ordering::Relaxed);
         }
+        tauri::RunEvent::WindowEvent { label, event, .. } => {
+            if let tauri::WindowEvent::Destroyed = event {
+                let state: &AppState = app_handle.state::<AppState>().inner();
+                if let Ok(mut map) = state.backends.lock() {
+                    map.remove(&label);
+                }
+                if label == "picker" {
+                    app_handle.exit(0);
+                }
+            }
+        }
+        _ => {}
     });
 }

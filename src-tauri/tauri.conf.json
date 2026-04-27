@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "cub-dev",
+  "productName": "diff",
   "version": "0.1.0",
-  "identifier": "com.ephraimduncan.cub-dev",
+  "identifier": "com.fourcadefran.diff",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
@@ -12,11 +12,15 @@
   "app": {
     "windows": [
       {
-        "title": "cub-dev",
-        "width": 1200,
-        "height": 800,
-        "minWidth": 1200,
-        "minHeight": 800
+        "label": "picker",
+        "title": "diff",
+        "url": "index.html?kind=picker",
+        "width": 480,
+        "height": 600,
+        "minWidth": 380,
+        "minHeight": 480,
+        "center": true,
+        "resizable": true
       }
     ],
     "security": {
@@ -26,7 +30,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "resources": ["../sidecar/cub-mcp.js"],
+    "resources": ["../sidecar/diff-mcp.js"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

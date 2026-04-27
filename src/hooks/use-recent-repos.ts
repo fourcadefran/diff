@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
 
-const STORAGE_KEY = "cub:recent-repos";
+const STORAGE_KEY = "diff:recent-repos";
 const MAX_RECENTS = 8;
 
 export interface RecentRepo {

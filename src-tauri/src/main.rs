@@ -10,24 +10,44 @@ fn main() -> ExitCode {
         return run_mcp_mode();
     }
 
-    // First non-flag positional = launch path
-    if let Some(path) = args.iter().find(|a| !a.starts_with('-')) {
-        if let Ok(abs) = std::fs::canonicalize(path) {
-            cub_dev_lib::set_launch_path(abs);
-        } else {
-            eprintln!("[cub] could not resolve path: {path}");
+    // First non-flag positional: either `<host>:<path>` (remote) or `<local-path>`.
+    if let Some(arg) = args.iter().find(|a| !a.starts_with('-')) {
+        match parse_host_path(arg) {
+            Some((host, path)) => {
+                diff_lib::set_launch_spec(diff_lib::LaunchSpec::Remote {
+                    host: host.to_string(),
+                    path: path.to_string(),
+                });
+            }
+            None => match std::fs::canonicalize(arg) {
+                Ok(abs) => diff_lib::set_launch_spec(diff_lib::LaunchSpec::Local(abs)),
+                Err(_) => eprintln!("[diff] could not resolve path: {arg}"),
+            },
         }
     }
 
-    cub_dev_lib::run();
+    diff_lib::run();
     ExitCode::SUCCESS
 }
 
+/// Match "host:/abs/path" but NOT "/abs/path" or "C:/Users/..." (the latter
+/// has '/' in the head which we reject).
+fn parse_host_path(arg: &str) -> Option<(&str, &str)> {
+    let (head, tail) = arg.split_once(':')?;
+    if head.is_empty() || head.contains('/') || head.contains('\\') {
+        return None;
+    }
+    if tail.is_empty() {
+        return None;
+    }
+    Some((head, tail))
+}
+
 fn run_mcp_mode() -> ExitCode {
-    let script = match cub_dev_lib::sidecar_script_path() {
+    let script = match diff_lib::sidecar_script_path() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[cub] {e}");
+            eprintln!("[diff] {e}");
             return ExitCode::from(2);
         }
     };
@@ -39,7 +59,7 @@ fn run_mcp_mode() -> ExitCode {
         Err(node_err) => match spawn("bun") {
             Ok(s) => s,
             Err(bun_err) => {
-                eprintln!("[cub] failed to spawn MCP sidecar: node={node_err}, bun={bun_err}");
+                eprintln!("[diff] failed to spawn MCP sidecar: node={node_err}, bun={bun_err}");
                 return ExitCode::from(1);
             }
         },
