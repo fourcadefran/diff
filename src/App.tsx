@@ -20,7 +20,6 @@ import {
   commit,
   submitReview,
   discardFile,
-  openRemoteRepo,
   type CommitOptions,
   type FileEntry,
 } from "@/lib/tauri";
@@ -50,7 +49,7 @@ function App() {
 }
 
 function RepoApp() {
-  const { workdir, status, error, refresh, open, close } = useRepoStatus();
+  const { workdir, status, error, refresh, open, openRemote, close } = useRepoStatus();
   const { diffs, loading } = useDiffs(status?.staged, status?.unstaged);
   const comments = useComments();
   const [diffStyle, setDiffStyle] = useState<"unified" | "split">("split");
@@ -387,17 +386,23 @@ function RepoApp() {
   // Open the repo this window was spawned for (host/path in URL query).
   const openRef = useRef(open);
   openRef.current = open;
+  const openRemoteRef = useRef(openRemote);
+  openRemoteRef.current = openRemote;
   useEffect(() => {
     const params = getRepoParams();
     if (!params || restoreOpenStartedRef.current) return;
     restoreOpenStartedRef.current = true;
-    perfLog("App", "open:restore", { source: "url", path: params.path });
+    perfLog("App", "open:restore", {
+      source: "url",
+      host: params.host,
+      path: params.path,
+    });
     if (params.host === "local") {
       openRef.current(params.path).catch((e) =>
         toast.error(`Failed to open: ${e}`),
       );
     } else {
-      openRemoteRepo(params.host, params.path).catch((e) => {
+      openRemoteRef.current(params.host, params.path).catch((e) => {
         const msg = String(e);
         if (msg.includes("Could not connect to diff-agent")) {
           toast.error(msg, { duration: 30000 });

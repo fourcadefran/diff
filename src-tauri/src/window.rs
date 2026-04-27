@@ -23,7 +23,7 @@ pub fn open_repo_window(app: &AppHandle, host: &str, path: &str) -> Result<(), S
     };
 
     let url = format!(
-        "index.html?kind=repo&host={}&path={}",
+        "index.html#kind=repo&host={}&path={}",
         urlencoding::encode(host),
         urlencoding::encode(path)
     );

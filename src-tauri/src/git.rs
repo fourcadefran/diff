@@ -307,7 +307,18 @@ pub fn open_remote_repo(
     state: State<AppState>,
 ) -> Result<String, String> {
     let mut cmd = Command::new("ssh");
-    cmd.args([&host, "diff-agent", "--stdio", "--repo", &path]);
+    // ClearAllForwardings prevents inheriting LocalForward/RemoteForward from
+    // ~/.ssh/config — the agent uses stdio only and binding to those ports
+    // would just print noise (or fail if the ports are in use).
+    cmd.args([
+        "-o",
+        "ClearAllForwardings=yes",
+        &host,
+        "diff-agent",
+        "--stdio",
+        "--repo",
+        &path,
+    ]);
 
     let backend = crate::remote_backend::RemoteGitBackend::spawn(cmd)
         .map_err(|e| format!("ssh spawn failed: {e}"))?;
