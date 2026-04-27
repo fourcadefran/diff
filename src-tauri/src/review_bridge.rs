@@ -267,10 +267,10 @@ pub fn start_event_listener(
                     Err(_) => break, // connection dropped, reconnect
                 };
 
-                if line.starts_with("event: ") {
-                    event_name = line[7..].to_string();
-                } else if line.starts_with("data: ") {
-                    data_buf.push_str(&line[6..]);
+                if let Some(stripped) = line.strip_prefix("event: ") {
+                    event_name = stripped.to_string();
+                } else if let Some(stripped) = line.strip_prefix("data: ") {
+                    data_buf.push_str(stripped);
                 } else if line.is_empty() {
                     // End of SSE message — dispatch if we have data
                     if event_name == "comment_status_changed" && !data_buf.is_empty() {
@@ -341,7 +341,7 @@ pub fn submit_review(
     let response: SubmitResponse = http_agent()
         .post(&url)
         .header("Content-Type", "application/json")
-        .send_json(&serde_json::json!({ "comments": comments }))
+        .send_json(serde_json::json!({ "comments": comments }))
         .map_err(|e| format!("failed to submit review: {e}"))?
         .body_mut()
         .read_json()

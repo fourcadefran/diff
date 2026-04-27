@@ -445,8 +445,7 @@ impl GitBackend for LocalGitBackend {
         &self,
         sink: Box<dyn Fn() + Send + Sync>,
     ) -> Result<WatcherHandle, BackendError> {
-        let watcher_inst =
-            watcher::start(&self.workdir, move || sink()).map_err(BackendError::Io)?;
+        let watcher_inst = watcher::start(&self.workdir, sink).map_err(BackendError::Io)?;
         Ok(WatcherHandle {
             _inner: Box::new(watcher_inst),
         })

@@ -202,7 +202,7 @@ pub fn clone_repo(
         .map_err(|e| format!("lock poisoned: {e}"))?
         .insert(id.clone(), cancel.clone());
 
-    let result = (|| -> Result<Repository, String> {
+    let result: Result<Repository, String> = {
         let mut cb = RemoteCallbacks::new();
         let a1 = app.clone();
         let i1 = id.clone();
@@ -263,7 +263,7 @@ pub fn clone_repo(
                     format!("clone failed: {e}")
                 }
             })
-    })();
+    };
 
     if let Ok(mut guard) = state.clone_cancels.lock() {
         guard.remove(&id);
