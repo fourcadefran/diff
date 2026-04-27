@@ -23,10 +23,7 @@ impl LocalGitBackend {
     /// Open a repository at `path` (discovers .git from inside subdirs).
     pub fn open(path: &Path) -> Result<Self, BackendError> {
         let repo = Repository::discover(path).map_err(BackendError::from)?;
-        let workdir = repo
-            .workdir()
-            .ok_or(BackendError::BareRepo)?
-            .to_path_buf();
+        let workdir = repo.workdir().ok_or(BackendError::BareRepo)?.to_path_buf();
         Ok(Self {
             repo: Mutex::new(repo),
             workdir,
@@ -37,10 +34,7 @@ impl LocalGitBackend {
     pub fn init(path: &Path) -> Result<Self, BackendError> {
         std::fs::create_dir_all(path)?;
         let repo = Repository::init(path).map_err(BackendError::from)?;
-        let workdir = repo
-            .workdir()
-            .ok_or(BackendError::BareRepo)?
-            .to_path_buf();
+        let workdir = repo.workdir().ok_or(BackendError::BareRepo)?.to_path_buf();
         Ok(Self {
             repo: Mutex::new(repo),
             workdir,
@@ -152,8 +146,7 @@ impl GitBackend for LocalGitBackend {
                 } else {
                     ChangeKind::Typechange
                 };
-                let (additions, deletions) =
-                    unstaged_counts.get(&path).copied().unwrap_or((0, 0));
+                let (additions, deletions) = unstaged_counts.get(&path).copied().unwrap_or((0, 0));
                 unstaged.push(FileEntry {
                     path: path.clone(),
                     kind,
@@ -452,8 +445,8 @@ impl GitBackend for LocalGitBackend {
         &self,
         sink: Box<dyn Fn() + Send + Sync>,
     ) -> Result<WatcherHandle, BackendError> {
-        let watcher_inst = watcher::start(&self.workdir, move || sink())
-            .map_err(BackendError::Io)?;
+        let watcher_inst =
+            watcher::start(&self.workdir, move || sink()).map_err(BackendError::Io)?;
         Ok(WatcherHandle {
             _inner: Box::new(watcher_inst),
         })
@@ -662,10 +655,7 @@ fn read_tree_file(
         ))
     })?;
     let blob = object.into_blob().map_err(|_| {
-        BackendError::Git(format!(
-            "HEAD entry for {} is not a blob",
-            path.display()
-        ))
+        BackendError::Git(format!("HEAD entry for {} is not a blob", path.display()))
     })?;
 
     Ok(decode_file_side(blob.content()))
@@ -886,11 +876,9 @@ fn remove_workdir_entry(target: &Path) -> Result<(), BackendError> {
     };
     let ft = meta.file_type();
     if ft.is_dir() {
-        std::fs::remove_dir_all(target)
-            .map_err(|e| BackendError::Io(format!("remove failed: {e}")))
+        std::fs::remove_dir_all(target).map_err(|e| BackendError::Io(format!("remove failed: {e}")))
     } else {
-        std::fs::remove_file(target)
-            .map_err(|e| BackendError::Io(format!("remove failed: {e}")))
+        std::fs::remove_file(target).map_err(|e| BackendError::Io(format!("remove failed: {e}")))
     }
 }
 
@@ -898,21 +886,21 @@ fn canonical_contained_target(
     workdir: &Path,
     relative_path: &Path,
 ) -> Result<PathBuf, BackendError> {
-    let canonical_workdir = workdir.canonicalize().map_err(|e| {
-        BackendError::Io(format!("cannot canonicalize workdir: {e}"))
-    })?;
+    let canonical_workdir = workdir
+        .canonicalize()
+        .map_err(|e| BackendError::Io(format!("cannot canonicalize workdir: {e}")))?;
     let target = canonical_workdir.join(relative_path);
     let safe_target = if target.exists() {
-        target.canonicalize().map_err(|e| {
-            BackendError::Io(format!("cannot canonicalize target: {e}"))
-        })?
+        target
+            .canonicalize()
+            .map_err(|e| BackendError::Io(format!("cannot canonicalize target: {e}")))?
     } else {
         let parent = target
             .parent()
             .ok_or_else(|| BackendError::InvalidPath("invalid path".to_string()))?;
-        let parent_canonical = parent.canonicalize().map_err(|e| {
-            BackendError::Io(format!("cannot canonicalize parent: {e}"))
-        })?;
+        let parent_canonical = parent
+            .canonicalize()
+            .map_err(|e| BackendError::Io(format!("cannot canonicalize parent: {e}")))?;
         parent_canonical.join(target.file_name().unwrap_or_default())
     };
     if !safe_target.starts_with(&canonical_workdir) {
